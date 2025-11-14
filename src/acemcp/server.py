@@ -11,7 +11,7 @@ from mcp.types import Tool
 
 from acemcp.config import get_config, init_config
 from acemcp.logging_config import setup_logging
-from acemcp.tools import search_context_tool
+from acemcp.tools import search_context_tool, shutdown_index_manager
 from acemcp.web import create_app
 
 app = Server("acemcp")
@@ -94,6 +94,7 @@ async def main(base_url: str | None = None, token: str | None = None, web_port: 
         token: Override TOKEN from command line
         web_port: Port for web management interface (None to disable)
     """
+    web_task: asyncio.Task | None = None
     try:
         config = init_config(base_url=base_url, token=token)
         config.validate()
@@ -108,12 +109,13 @@ async def main(base_url: str | None = None, token: str | None = None, web_port: 
         async with stdio_server() as (read_stream, write_stream):
             await app.run(read_stream, write_stream, app.create_initialization_options())
 
-        if web_port:
-            web_task.cancel()
-
     except Exception:
         logger.exception("Server error")
         raise
+    finally:
+        if web_task:
+            web_task.cancel()
+        await shutdown_index_manager()
 
 
 def run() -> None:
@@ -140,4 +142,3 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
-

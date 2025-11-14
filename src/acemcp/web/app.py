@@ -206,5 +206,11 @@ def create_app() -> FastAPI:
         finally:
             log_broadcaster.remove_client(queue)
 
-    return app
+    @app.on_event("shutdown")
+    async def shutdown_tools() -> None:
+        """Release shared tool resources when the web app stops."""
+        from acemcp.tools import shutdown_index_manager
 
+        await shutdown_index_manager()
+
+    return app

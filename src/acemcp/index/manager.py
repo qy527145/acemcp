@@ -88,7 +88,25 @@ class IndexManager:
         self.max_lines_per_blob = max_lines_per_blob
         self.exclude_patterns = exclude_patterns or []
         self.projects_file = storage_path / "projects.json"
+        self._client: httpx.AsyncClient | None = None
         logger.info(f"IndexManager initialized with storage path: {storage_path}, batch_size: {batch_size}, max_lines_per_blob: {max_lines_per_blob}, exclude_patterns: {len(self.exclude_patterns)} patterns")
+
+    def _get_client(self) -> httpx.AsyncClient:
+        """Get or create httpx AsyncClient instance.
+
+        Returns:
+            httpx.AsyncClient instance
+        """
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=60.0)
+            logger.debug("Created new httpx.AsyncClient")
+        return self._client
+
+    async def close(self) -> None:
+        """Close httpx client and release resources."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            logger.debug("Closed httpx.AsyncClient")
 
     def _normalize_path(self, path: str) -> str:
         """Normalize path to use forward slashes.
@@ -379,41 +397,41 @@ class IndexManager:
                 total_batches = (len(blobs_to_upload) + self.batch_size - 1) // self.batch_size
                 logger.info(f"Uploading {len(blobs_to_upload)} new blobs in {total_batches} batches (batch_size={self.batch_size})")
 
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    for batch_idx in range(total_batches):
-                        start_idx = batch_idx * self.batch_size
-                        end_idx = min(start_idx + self.batch_size, len(blobs_to_upload))
-                        batch_blobs = blobs_to_upload[start_idx:end_idx]
+                client = self._get_client()
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * self.batch_size
+                    end_idx = min(start_idx + self.batch_size, len(blobs_to_upload))
+                    batch_blobs = blobs_to_upload[start_idx:end_idx]
 
-                        logger.info(f"Uploading batch {batch_idx + 1}/{total_batches} ({len(batch_blobs)} blobs)")
+                    logger.info(f"Uploading batch {batch_idx + 1}/{total_batches} ({len(batch_blobs)} blobs)")
 
-                        try:
-                            async def upload_batch():
-                                payload = {"blobs": batch_blobs}
-                                response = await client.post(
-                                    f"{self.base_url}/batch-upload",
-                                    headers={"Authorization": f"Bearer {self.token}"},
-                                    json=payload,
-                                )
-                                response.raise_for_status()
-                                return response.json()
+                    try:
+                        async def upload_batch():
+                            payload = {"blobs": batch_blobs}
+                            response = await client.post(
+                                f"{self.base_url}/batch-upload",
+                                headers={"Authorization": f"Bearer {self.token}"},
+                                json=payload,
+                            )
+                            response.raise_for_status()
+                            return response.json()
 
-                            # Retry up to 3 times with exponential backoff
-                            result = await self._retry_request(upload_batch, max_retries=3, retry_delay=1.0)
+                        # Retry up to 3 times with exponential backoff
+                        result = await self._retry_request(upload_batch, max_retries=3, retry_delay=1.0)
 
-                            batch_blob_names = result.get("blob_names", [])
-                            if not batch_blob_names:
-                                logger.warning(f"Batch {batch_idx + 1} returned no blob names")
-                                failed_batches.append(batch_idx + 1)
-                                continue
-
-                            uploaded_blob_names.extend(batch_blob_names)
-                            logger.info(f"Batch {batch_idx + 1} uploaded successfully, got {len(batch_blob_names)} blob names")
-
-                        except Exception as e:
-                            logger.error(f"Batch {batch_idx + 1} failed after retries: {e}. Continuing with next batch...")
+                        batch_blob_names = result.get("blob_names", [])
+                        if not batch_blob_names:
+                            logger.warning(f"Batch {batch_idx + 1} returned no blob names")
                             failed_batches.append(batch_idx + 1)
                             continue
+
+                        uploaded_blob_names.extend(batch_blob_names)
+                        logger.info(f"Batch {batch_idx + 1} uploaded successfully, got {len(batch_blob_names)} blob names")
+
+                    except Exception as e:
+                        logger.error(f"Batch {batch_idx + 1} failed after retries: {e}. Continuing with next batch...")
+                        failed_batches.append(batch_idx + 1)
+                        continue
 
                 if not uploaded_blob_names and blobs_to_upload:
                     if failed_batches:
@@ -519,22 +537,22 @@ class IndexManager:
                 "enable_commit_retrieval": False,
             }
 
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                async def search_request():
-                    response = await client.post(
-                        f"{self.base_url}/agents/codebase-retrieval",
-                        headers={"Authorization": f"Bearer {self.token}"},
-                        json=payload,
-                    )
-                    response.raise_for_status()
-                    return response.json()
+            client = self._get_client()
+            async def search_request():
+                response = await client.post(
+                    f"{self.base_url}/agents/codebase-retrieval",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                    json=payload,
+                )
+                response.raise_for_status()
+                return response.json()
 
-                # Retry up to 3 times with exponential backoff
-                try:
-                    result = await self._retry_request(search_request, max_retries=3, retry_delay=2.0)
-                except Exception as e:
-                    logger.error(f"Search request failed after retries: {e}")
-                    return f"Error: Search request failed after 3 retries. {e!s}"
+            # Retry up to 3 times with exponential backoff
+            try:
+                result = await self._retry_request(search_request, max_retries=3, retry_delay=2.0)
+            except Exception as e:
+                logger.error(f"Search request failed after retries: {e}")
+                return f"Error: Search request failed after 3 retries. {e!s}"
 
             formatted_retrieval = result.get("formatted_retrieval", "")
 
