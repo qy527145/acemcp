@@ -2,7 +2,10 @@
 
 import argparse
 import asyncio
+import sys
+from io import TextIOWrapper
 
+import anyio
 from loguru import logger
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -120,7 +123,10 @@ async def main(base_url: str | None = None, token: str | None = None, web_port: 
             logger.info(f"Starting web management interface on port {web_port}")
             web_task = asyncio.create_task(run_web_server(web_port))
 
-        async with stdio_server() as (read_stream, write_stream):
+        stdin = anyio.wrap_file(TextIOWrapper(sys.stdin.buffer, encoding="utf-8", newline='\n'))
+        stdout = anyio.wrap_file(TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline='\n'))
+
+        async with stdio_server(stdin=stdin, stdout=stdout) as (read_stream, write_stream):
             await app.run(read_stream, write_stream, app.create_initialization_options())
 
     except Exception:
