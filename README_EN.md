@@ -333,6 +333,23 @@ To enable the web interface, use the `--web-port` argument when starting the ser
 
 ## Recent Updates
 
+### Version 0.2.2
+
+**New Features:**
+- ✨ **Upload Exception Handling System**: Brand new intelligent exception handling mechanism
+  - **Binary Search Localization**: Automatically uses binary search to precisely locate failed blobs when batch uploads fail
+  - **Failed Blob Storage**: Records detailed information of failed blobs (file path, hash, error message, timestamp)
+  - **Intelligent Recovery**: Recovers successful blobs from failed batches, maximizing upload success rate
+  - **Search Optimization**: Automatically excludes failed blobs during search to ensure result reliability
+- ✨ **Enhanced Exception Logging**: Detailed logging of each blob's file path and hash value
+- ✨ **Web Console Integration**: New `/api/failed-blobs` API endpoint supporting web console display of exception information
+
+**Technical Details:**
+- Implemented `_binary_search_failed_blobs()` recursive binary search algorithm with O(log n) complexity
+- Added `failed_blobs.json` storage file to record project failed blob information
+- Search functionality automatically filters failed blobs with statistical information
+- Complete exception handling workflow: Detection → Localization → Recording → Exclusion
+
 ### Version 0.2.1
 
 **Improvements:**

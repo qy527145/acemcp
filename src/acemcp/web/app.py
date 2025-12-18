@@ -137,6 +137,46 @@ def create_app() -> FastAPI:
 
         return {"status": "running", "project_count": project_count, "storage_path": str(config.index_storage_path)}
 
+    @app.get("/api/failed-blobs")
+    async def get_failed_blobs() -> dict:
+        """Get failed blobs information for all projects.
+
+        Returns:
+            Dictionary containing failed blobs information for each project
+
+        """
+        try:
+            config = get_config()
+            failed_blobs_file = config.index_storage_path / "failed_blobs.json"
+
+            if not failed_blobs_file.exists():
+                return {"failed_blobs": {}, "total_failed": 0}
+
+            import json
+            with failed_blobs_file.open("r", encoding="utf-8") as f:
+                failed_blobs_data = json.load(f)
+
+            # Calculate total failed blobs count
+            total_failed = sum(len(blobs) for blobs in failed_blobs_data.values())
+
+            # Format the data for web display
+            formatted_data = {}
+            for project_path, failed_blobs in failed_blobs_data.items():
+                formatted_data[project_path] = {
+                    "count": len(failed_blobs),
+                    "blobs": failed_blobs
+                }
+
+            return {
+                "failed_blobs": formatted_data,
+                "total_failed": total_failed,
+                "projects_with_failures": len(failed_blobs_data)
+            }
+
+        except Exception as e:
+            logger.exception("Failed to load failed blobs data")
+            return {"status": "error", "message": f"Failed to load failed blobs: {str(e)}"}
+
     @app.post("/api/validate-token")
     async def validate_token(config_update: ConfigUpdate) -> dict:
         """Validate token by making a test request to the API.

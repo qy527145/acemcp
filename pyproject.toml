@@ -1,6 +1,6 @@
 [project]
 name = "acemcp"
-version = "0.2.1"
+version = "0.2.2"
 description = "MCP server for codebase indexing and semantic search with multi-encoding support and .gitignore integration"
 readme = "README.md"
 authors = [

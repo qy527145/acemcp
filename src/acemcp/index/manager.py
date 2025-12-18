@@ -91,6 +91,7 @@ class IndexManager:
         self.max_lines_per_blob = max_lines_per_blob
         self.exclude_patterns = exclude_patterns or []
         self.projects_file = storage_path / "projects.json"
+        self.failed_blobs_file = storage_path / "failed_blobs.json"
         self._client: httpx.AsyncClient | None = None
         logger.info(f"IndexManager initialized with storage path: {storage_path}, batch_size: {batch_size}, max_lines_per_blob: {max_lines_per_blob}, exclude_patterns: {len(self.exclude_patterns)} patterns")
 
@@ -265,6 +266,86 @@ class IndexManager:
             logger.exception("Failed to save projects data")
             raise
 
+    def _load_failed_blobs(self) -> dict[str, list[dict]]:
+        """Load failed blobs data from storage.
+
+        Returns:
+            Dictionary mapping normalized project_root_path to list of failed blob info
+            Each failed blob info contains: {"blob_hash": str, "path": str, "error": str, "timestamp": str}
+
+        """
+        if not self.failed_blobs_file.exists():
+            return {}
+        try:
+            with self.failed_blobs_file.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            logger.exception("Failed to load failed blobs data")
+            return {}
+
+    def _save_failed_blobs(self, failed_blobs: dict[str, list[dict]]) -> None:
+        """Save failed blobs data to storage.
+
+        Args:
+            failed_blobs: Dictionary mapping normalized project_root_path to list of failed blob info
+
+        """
+        try:
+            with self.failed_blobs_file.open("w", encoding="utf-8") as f:
+                json.dump(failed_blobs, f, indent=2, ensure_ascii=False)
+        except Exception:
+            logger.exception("Failed to save failed blobs data")
+            raise
+
+    def _add_failed_blob(self, project_path: str, blob_hash: str, blob_path: str, error: str) -> None:
+        """Add a failed blob to the failed blobs storage.
+
+        Args:
+            project_path: Normalized project path
+            blob_hash: Hash of the failed blob
+            blob_path: Path of the failed blob
+            error: Error message
+
+        """
+        import datetime
+
+        failed_blobs = self._load_failed_blobs()
+        if project_path not in failed_blobs:
+            failed_blobs[project_path] = []
+
+        # Check if this blob is already recorded
+        for existing in failed_blobs[project_path]:
+            if existing["blob_hash"] == blob_hash:
+                # Update existing record
+                existing["error"] = error
+                existing["timestamp"] = datetime.datetime.now().isoformat()
+                self._save_failed_blobs(failed_blobs)
+                return
+
+        # Add new failed blob record
+        failed_blobs[project_path].append({
+            "blob_hash": blob_hash,
+            "path": blob_path,
+            "error": error,
+            "timestamp": datetime.datetime.now().isoformat()
+        })
+        self._save_failed_blobs(failed_blobs)
+        logger.warning(f"Added failed blob to storage: {blob_path} (hash: {blob_hash[:8]}...)")
+
+    def _get_failed_blob_hashes(self, project_path: str) -> set[str]:
+        """Get set of failed blob hashes for a project.
+
+        Args:
+            project_path: Normalized project path
+
+        Returns:
+            Set of failed blob hashes
+
+        """
+        failed_blobs = self._load_failed_blobs()
+        project_failed = failed_blobs.get(project_path, [])
+        return {blob["blob_hash"] for blob in project_failed}
+
     def _split_file_content(self, path: str, content: str) -> list[dict[str, str]]:
         """Split file content into multiple blobs if it exceeds max_lines_per_blob.
 
@@ -355,6 +436,93 @@ class IndexManager:
         logger.info(f"Collected {len(blobs)} blobs from {project_root_path} (excluded {excluded_count} files/directories)")
         return blobs
 
+    async def _binary_search_failed_blobs(self, blobs: list[dict], project_path: str, error_msg: str) -> list[dict]:
+        """Use binary search to identify specific failed blobs in a batch.
+
+        Args:
+            blobs: List of blobs that failed to upload
+            project_path: Normalized project path
+            error_msg: Original error message from batch upload
+
+        Returns:
+            List of successfully identified failed blobs
+
+        """
+        if len(blobs) <= 1:
+            # Base case: single blob, mark it as failed
+            if blobs:
+                blob = blobs[0]
+                blob_hash = calculate_blob_name(blob["path"], blob["content"])
+                self._add_failed_blob(project_path, blob_hash, blob["path"], error_msg)
+                logger.error(f"Binary search identified failed blob: {blob['path']} (hash: {blob_hash[:8]}...)")
+            return []
+
+        # Split blobs into two halves
+        mid = len(blobs) // 2
+        first_half = blobs[:mid]
+        second_half = blobs[mid:]
+
+        logger.info(f"Binary search: testing first half with {len(first_half)} blobs...")
+
+        # Test first half
+        client = self._get_client()
+        first_half_success = False
+        try:
+            async def test_first_half():
+                payload = {"blobs": first_half}
+                response = await client.post(
+                    f"{self.base_url}/batch-upload",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                    json=payload,
+                )
+                response.raise_for_status()
+                return response.json()
+
+            result = await self._retry_request(test_first_half, max_retries=2, retry_delay=0.5)
+            if result.get("blob_names"):
+                first_half_success = True
+                logger.info(f"Binary search: first half succeeded with {len(result['blob_names'])} blobs")
+        except Exception as e:
+            logger.warning(f"Binary search: first half failed: {e}")
+
+        # Test second half
+        logger.info(f"Binary search: testing second half with {len(second_half)} blobs...")
+        second_half_success = False
+        try:
+            async def test_second_half():
+                payload = {"blobs": second_half}
+                response = await client.post(
+                    f"{self.base_url}/batch-upload",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                    json=payload,
+                )
+                response.raise_for_status()
+                return response.json()
+
+            result = await self._retry_request(test_second_half, max_retries=2, retry_delay=0.5)
+            if result.get("blob_names"):
+                second_half_success = True
+                logger.info(f"Binary search: second half succeeded with {len(result['blob_names'])} blobs")
+        except Exception as e:
+            logger.warning(f"Binary search: second half failed: {e}")
+
+        # Recursively process failed halves
+        successful_blobs = []
+
+        if first_half_success:
+            successful_blobs.extend(first_half)
+        else:
+            # Recursively search in first half
+            successful_blobs.extend(await self._binary_search_failed_blobs(first_half, project_path, error_msg))
+
+        if second_half_success:
+            successful_blobs.extend(second_half)
+        else:
+            # Recursively search in second half
+            successful_blobs.extend(await self._binary_search_failed_blobs(second_half, project_path, error_msg))
+
+        return successful_blobs
+
     async def index_project(self, project_root_path: str) -> dict[str, str]:
         """Index a code project with incremental indexing support.
 
@@ -435,7 +603,46 @@ class IndexManager:
                         logger.info(f"Batch {batch_idx + 1} uploaded successfully, got {len(batch_blob_names)} blob names")
 
                     except Exception as e:
-                        logger.error(f"Batch {batch_idx + 1} failed after retries: {e}. Continuing with next batch...")
+                        # Enhanced error logging with detailed blob information
+                        blob_paths = [blob["path"] for blob in batch_blobs]
+                        blob_info = []
+                        for blob in batch_blobs:
+                            blob_hash = calculate_blob_name(blob["path"], blob["content"])
+                            blob_info.append(f"{blob['path']} (hash: {blob_hash[:8]}...)")
+
+                        logger.error(f"Batch {batch_idx + 1} failed after retries: {e}")
+                        logger.error(f"Failed batch contained {len(batch_blobs)} blobs:")
+                        for info in blob_info:
+                            logger.error(f"  - {info}")
+
+                        # Use binary search to identify specific failed blobs
+                        logger.info(f"Starting binary search to identify failed blobs in batch {batch_idx + 1}...")
+                        try:
+                            successful_blobs = await self._binary_search_failed_blobs(batch_blobs, normalized_path, str(e))
+
+                            if successful_blobs:
+                                # Upload successful blobs from binary search
+                                logger.info(f"Binary search recovered {len(successful_blobs)} blobs from failed batch {batch_idx + 1}")
+
+                                async def upload_recovered_blobs():
+                                    payload = {"blobs": successful_blobs}
+                                    response = await client.post(
+                                        f"{self.base_url}/batch-upload",
+                                        headers={"Authorization": f"Bearer {self.token}"},
+                                        json=payload,
+                                    )
+                                    response.raise_for_status()
+                                    return response.json()
+
+                                recovered_result = await self._retry_request(upload_recovered_blobs, max_retries=2, retry_delay=0.5)
+                                recovered_blob_names = recovered_result.get("blob_names", [])
+                                if recovered_blob_names:
+                                    uploaded_blob_names.extend(recovered_blob_names)
+                                    logger.info(f"Successfully uploaded {len(recovered_blob_names)} recovered blobs from batch {batch_idx + 1}")
+
+                        except Exception as binary_search_error:
+                            logger.error(f"Binary search failed for batch {batch_idx + 1}: {binary_search_error}")
+
                         failed_batches.append(batch_idx + 1)
                         continue
 
@@ -515,15 +722,26 @@ class IndexManager:
                 stats = index_result["stats"]
                 logger.info(f"Auto-indexing completed: total={stats['total_blobs']}, existing={stats['existing_blobs']}, new={stats['new_blobs']}")
 
-            # Step 2: Load indexed blob names
+            # Step 2: Load indexed blob names and exclude failed blobs
             projects = self._load_projects()
-            blob_names = projects.get(normalized_path, [])
+            all_blob_names = projects.get(normalized_path, [])
 
-            if not blob_names:
+            if not all_blob_names:
                 return f"Error: No blobs found for project {normalized_path} after indexing."
 
+            # Get failed blob hashes and exclude them from search
+            failed_blob_hashes = self._get_failed_blob_hashes(normalized_path)
+            blob_names = [blob_hash for blob_hash in all_blob_names if blob_hash not in failed_blob_hashes]
+
+            excluded_count = len(all_blob_names) - len(blob_names)
+            if excluded_count > 0:
+                logger.info(f"Excluded {excluded_count} failed blobs from search (total available: {len(all_blob_names)}, searching: {len(blob_names)})")
+
+            if not blob_names:
+                return f"Error: No valid blobs available for search in project {normalized_path}. All {len(all_blob_names)} blobs have failed upload."
+
             # Step 3: Perform search
-            logger.info(f"Performing search with {len(blob_names)} blobs...")
+            logger.info(f"Performing search with {len(blob_names)} blobs (excluded {excluded_count} failed blobs)...")
             payload = {
                 "information_request": query,
                 "blobs": {
